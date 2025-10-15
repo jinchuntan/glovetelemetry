@@ -1,0 +1,259 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Glove Telemetry Dashboard</title>
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <style>
+    :root { --bg:#0b0c10; --panel:#111317; --ink:#e5e7eb; --muted:#9ca3af; --accent:#60a5fa; }
+    * { box-sizing: border-box; }
+    html,body { height:100%; margin:0; background:var(--bg); color:var(--ink); font:14px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; }
+    header { position:sticky; top:0; z-index:10; backdrop-filter: blur(8px); background:rgba(11,12,16,0.7); border-bottom:1px solid #1f242d; }
+    .wrap { max-width:1200px; margin:0 auto; padding:14px 16px; display:flex; align-items:center; gap:12px; }
+    .title { font-weight:600; letter-spacing:.2px; }
+    .badge { font-size:12px; padding:2px 8px; border:1px solid #1f242d; border-radius:999px; color:var(--muted); }
+    .grid { max-width:1200px; margin:16px auto; padding:0 16px; display:grid; gap:16px; grid-template-columns: repeat(12, 1fr); }
+    .card { background:var(--panel); border:1px solid #1f242d; border-radius:16px; padding:12px; }
+    .card h3 { margin:0 0 8px 0; font-size:13px; font-weight:600; color:#cbd5e1; }
+    .span-12 { grid-column: span 12; } .span-6 { grid-column: span 6; } .span-4 { grid-column: span 4; } .span-3 { grid-column: span 3; }
+    @media (max-width: 980px) { .span-6,.span-4,.span-3 { grid-column: span 12; } }
+    .toolbar { display:flex; gap:8px; align-items:center; margin-left:auto; }
+    .btn { padding:8px 10px; border-radius:10px; border:1px solid #1f242d; background:#0e1116; color:#e5e7eb; cursor:pointer; }
+    .btn.primary { background:#2563eb; border-color:#1d4ed8; }
+    .btn[disabled] { opacity:.5; cursor:not-allowed; }
+    .stat { display:flex; align-items:center; gap:8px; color:#d1d5db; }
+    .stat strong { font-size:18px; }
+    footer { color:#94a3b8; font-size:12px; max-width:1200px; margin:24px auto; padding:0 16px; }
+    canvas { width:100% !important; height:260px !important; }
+    .small canvas { height:180px !important; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <div class="title">Glove Telemetry • Real‑time</div>
+      <span id="conn" class="badge">Mode: Simulated</span>
+      <div class="toolbar">
+        <button id="toggle" class="btn primary">Pause</button>
+        <button id="reset" class="btn">Reset</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="grid">
+    <section class="card span-12">
+      <h3>Finger curl (%) — thumb, index, middle, ring, pinky</h3>
+      <canvas id="curlChart"></canvas>
+    </section>
+
+    <section class="card span-6">
+      <h3>Wrist orientation (°) — yaw / pitch / roll</h3>
+      <canvas id="wristChart"></canvas>
+    </section>
+
+    <section class="card span-6">
+      <h3>Packet rate (pps) & latency (ms)</h3>
+      <canvas id="netChart"></canvas>
+    </section>
+
+    <section class="card span-4 small">
+      <h3>Grip pressure (N) per finger</h3>
+      <canvas id="pressureChart"></canvas>
+    </section>
+
+    <section class="card span-4 small">
+      <h3>Contact state</h3>
+      <canvas id="contactChart"></canvas>
+    </section>
+
+    <section class="card span-4 small">
+      <h3>Battery & temperature</h3>
+      <canvas id="sysChart"></canvas>
+    </section>
+
+    <section class="card span-12">
+      <div class="stat">
+        <strong id="stat-rate">—</strong><span>packets/s</span> •
+        <strong id="stat-lat">—</strong><span>ms avg latency</span> •
+        <strong id="stat-loss">—</strong><span>% loss (sim)</span>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    Tip: Replace the simulator with a WebSocket that emits objects like:
+    <code>{curl:[0..100 x5], yaw,pitch,roll, pressure:[N x5], contact:[0/1 x5], battery, temp, latencyMs}</code>.
+  </footer>
+
+  <script>
+    // ----- Chart helpers -----
+    const LEN = 60; // number of points kept for line charts
+    function lineCfg(label, colorIdx) {
+      const palette = [
+        '#60a5fa', '#34d399', '#f87171', '#fbbf24', '#a78bfa', '#f472b6', '#22d3ee', '#fb7185'
+      ];
+      return {
+        label, data: new Array(LEN).fill(null),
+        borderColor: palette[colorIdx % palette.length],
+        backgroundColor: 'transparent',
+        tension: 0.25,
+        spanGaps: true,
+        pointRadius: 0,
+        borderWidth: 2,
+      };
+    }
+    function newTimeLabels(){ return Array.from({length:LEN}, (_,i)=> i - (LEN-1)); }
+
+    const commonOptions = {
+      animation: false,
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: { grid: { color: 'rgba(148,163,184,.12)' }, ticks: { color: '#94a3b8', maxTicksLimit: 6 } },
+        y: { grid: { color: 'rgba(148,163,184,.12)' }, ticks: { color: '#94a3b8' } }
+      },
+      plugins: {
+        legend: { labels: { color: '#cbd5e1' } },
+        tooltip: { mode: 'nearest', intersect: false }
+      }
+    };
+
+    // ----- Charts -----
+    const curlChart = new Chart(document.getElementById('curlChart'), {
+      type: 'line',
+      data: {
+        labels: newTimeLabels(),
+        datasets: ['Thumb','Index','Middle','Ring','Pinky'].map((n,i)=> lineCfg(n,i))
+      },
+      options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, min:0, max:100 } } }
+    });
+
+    const wristChart = new Chart(document.getElementById('wristChart'), {
+      type: 'line',
+      data: {
+        labels: newTimeLabels(),
+        datasets: ['Yaw','Pitch','Roll'].map((n,i)=> lineCfg(n,i))
+      },
+      options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, min:-90, max:90 } } }
+    });
+
+    const netChart = new Chart(document.getElementById('netChart'), {
+      type: 'line',
+      data: {
+        labels: newTimeLabels(),
+        datasets: [ lineCfg('Packets/s', 0), lineCfg('Latency (ms)', 2) ]
+      },
+      options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, min:0, max:120 } } }
+    });
+
+    const pressureChart = new Chart(document.getElementById('pressureChart'), {
+      type: 'bar',
+      data: {
+        labels: ['Thumb','Index','Middle','Ring','Pinky'],
+        datasets: [{ label: 'Pressure (N)', data: [0,0,0,0,0], backgroundColor: ['#60a5fa','#34d399','#f87171','#fbbf24','#a78bfa'] }]
+      },
+      options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, min:0, max:30 } } }
+    });
+
+    const contactChart = new Chart(document.getElementById('contactChart'), {
+      type: 'bar',
+      data: {
+        labels: ['Thumb','Index','Middle','Ring','Pinky'],
+        datasets: [{ label: 'Contact (0/1)', data: [0,0,0,0,0], backgroundColor: ['#60a5fa','#34d399','#f87171','#fbbf24','#a78bfa'] }]
+      },
+      options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, min:0, max:1, ticks: { stepSize: 1 } } } }
+    });
+
+    const sysChart = new Chart(document.getElementById('sysChart'), {
+      type: 'line',
+      data: {
+        labels: newTimeLabels(),
+        datasets: [ lineCfg('Battery %', 4), lineCfg('Temp °C', 5) ]
+      },
+      options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, min:0, max:100 } } }
+    });
+
+    const statRate = document.getElementById('stat-rate');
+    const statLat  = document.getElementById('stat-lat');
+    const statLoss = document.getElementById('stat-loss');
+
+    // ----- Simulator (replace this with WebSocket feed) -----
+    let running = true;
+    let t = 0;
+    let battery = 100;
+    let temp = 32;
+    let lossPct = 0;
+
+    const toggleBtn = document.getElementById('toggle');
+    const resetBtn  = document.getElementById('reset');
+    toggleBtn.onclick = () => { running = !running; toggleBtn.textContent = running ? 'Pause' : 'Resume'; toggleBtn.classList.toggle('primary', running); };
+    resetBtn.onclick  = () => { [curlChart, wristChart, netChart, sysChart].forEach(c => { c.data.labels = newTimeLabels(); c.data.datasets.forEach(d => d.data = new Array(LEN).fill(null)); c.update(); }); };
+
+    function pushLine(chart, values) {
+      chart.data.labels.push(++t);
+      chart.data.labels.shift();
+      chart.data.datasets.forEach((d,i)=> {
+        d.data.push(values[i]);
+        d.data.shift();
+      });
+      chart.update();
+    }
+
+    function simulatePacket(){
+      // Random finger curls (%)
+      const curls = Array.from({length:5}, (_,i)=> Math.max(0, Math.min(100, (50 + 30*Math.sin((t+i)/7) + (Math.random()*20-10)))));
+      // Wrist (deg)
+      const yaw = (Math.sin(t/10) * 30) + (Math.random()*6-3);
+      const pitch = (Math.cos(t/12) * 20) + (Math.random()*6-3);
+      const roll = (Math.sin(t/8) * 25) + (Math.random()*6-3);
+      // Pressure (N)
+      const pressure = curls.map(c=> Math.max(0, (c/100) * 25 + (Math.random()*3-1.5)));
+      // Contact binary
+      const contact = pressure.map(p=> p > 5 ? 1 : 0);
+      // Network stats
+      const pps = 50 + 20 * Math.sin(t/15) + (Math.random()*10-5);
+      const latency = 20 + 8*Math.sin(t/11) + (Math.random()*8-4);
+      lossPct = Math.max(0, Math.min(5, lossPct + (Math.random()*2-1)));
+
+      // Battery/Temp drift
+      battery = Math.max(0, battery - 0.005);
+      temp = Math.min(60, temp + (Math.random()*0.2 - 0.05));
+
+      return { curls, yaw, pitch, roll, pressure, contact, pps, latency, battery, temp, lossPct };
+    }
+
+    // Live loop
+    setInterval(()=> {
+      if (!running) return;
+      const pkt = simulatePacket();
+      pushLine(curlChart, pkt.curls);
+      pushLine(wristChart, [pkt.yaw, pkt.pitch, pkt.roll]);
+      pushLine(netChart, [pkt.pps, pkt.latency]);
+      pushLine(sysChart, [pkt.battery, Math.min(100, (pkt.temp/60)*100)]); // map 0-60C to 0-100 for same axis
+      pressureChart.data.datasets[0].data = pkt.pressure.map(v=> v.toFixed(2));
+      pressureChart.update();
+      contactChart.data.datasets[0].data = pkt.contact;
+      contactChart.update();
+
+      // Stats
+      statRate.textContent = pkt.pps.toFixed(1);
+      statLat.textContent  = pkt.latency.toFixed(1);
+      statLoss.textContent = pkt.lossPct.toFixed(1);
+    }, 250);
+
+    // ----- WebSocket wiring (swap out simulator) -----
+    // Example skeleton:
+    // const connBadge = document.getElementById('conn');
+    // const ws = new WebSocket('wss://your-glove-endpoint/socket');
+    // ws.onopen = () => { connBadge.textContent = 'Mode: Live WebSocket'; connBadge.style.color = '#34d399'; };
+    // ws.onmessage = (e) => {
+    //   const { curls, yaw, pitch, roll, pressure, contact, pps, latencyMs, battery, temp } = JSON.parse(e.data);
+    //   // Update charts like above with real values
+    // };
+    // ws.onclose = () => { connBadge.textContent = 'Mode: Disconnected'; connBadge.style.color = '#f87171'; };
+  </script>
+</body>
+</html>
